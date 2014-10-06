@@ -17,6 +17,7 @@ import contextlib
 import json
 
 import mock
+import netaddr
 from neutron.api.v2 import attributes as neutron_attrs
 from neutron.common import exceptions
 from oslo.config import cfg
@@ -251,7 +252,8 @@ class TestQuarkCreatePortRM9305(test_quark_plugin.TestQuarkPlugin):
         quark_ports.STRATEGY = network_strategy.JSONStrategy(strategy_json)
 
     @contextlib.contextmanager
-    def _stubs(self, port=None, network=None, addr=None, mac=None):
+    def _stubs(self, port=None, network=None, addr=None, mac=None,
+               satisfy_ipam=True):
         if network:
             network["network_plugin"] = "BASE"
             network["ipam_strategy"] = "ANY"
@@ -266,14 +268,17 @@ class TestQuarkCreatePortRM9305(test_quark_plugin.TestQuarkPlugin):
             mock.patch("%s.port_find" % db_mod),
             mock.patch("%s.allocate_ip_address" % ipam),
             mock.patch("%s.allocate_mac_address" % ipam),
+            mock.patch("%s.is_strategy_satisfied" % ipam),
+            mock.patch("%s._notify_new_addresses" % ipam),
             mock.patch("%s.port_count_all" % db_mod),
         ) as (port_create, net_find, port_find, alloc_ip, alloc_mac,
-              port_count):
+              ipam_satisfy, notify_new_addresses, port_count):
             port_create.return_value = port_models
             net_find.return_value = network
             port_find.return_value = None
             alloc_ip.return_value = addr
             alloc_mac.return_value = mac
+            ipam_satisfy.return_value = satisfy_ipam
             port_count.return_value = 0
             yield port_create
 
@@ -340,7 +345,7 @@ class TestQuarkCreatePortRM9305(test_quark_plugin.TestQuarkPlugin):
 class TestQuarkCreatePortsSameDevBadRequest(test_quark_plugin.TestQuarkPlugin):
     @contextlib.contextmanager
     def _stubs(self, port=None, network=None, addr=None, mac=None,
-               limit_checks=None):
+               limit_checks=None, satisfy_ipam=True):
         if network:
             network["network_plugin"] = "BASE"
             network["ipam_strategy"] = "ANY"
@@ -355,14 +360,18 @@ class TestQuarkCreatePortsSameDevBadRequest(test_quark_plugin.TestQuarkPlugin):
             mock.patch("%s.network_find" % db_mod),
             mock.patch("%s.allocate_ip_address" % ipam),
             mock.patch("%s.allocate_mac_address" % ipam),
+            mock.patch("%s.is_strategy_satisfied" % ipam),
+            mock.patch("%s._notify_new_addresses" % ipam),
             mock.patch("%s.port_count_all" % db_mod),
             mock.patch("neutron.quota.QuotaEngine.limit_check")
-        ) as (port_create, net_find, alloc_ip, alloc_mac, port_count,
-              limit_check):
+        ) as (port_create, net_find, alloc_ip, alloc_mac,
+              ipam_satify, notify_new_addresses,
+              port_count, limit_check):
             port_create.return_value = port_models
             net_find.return_value = network
             alloc_ip.return_value = addr
             alloc_mac.return_value = mac
+            ipam_satify.return_value = satisfy_ipam
             port_count.return_value = 0
             if limit_checks:
                 limit_check.side_effect = limit_checks
@@ -548,7 +557,8 @@ class TestQuarkPortCreateQuota(test_quark_plugin.TestQuarkPlugin):
 
 class TestQuarkUpdatePort(test_quark_plugin.TestQuarkPlugin):
     @contextlib.contextmanager
-    def _stubs(self, port, new_ips=None, parent_net=False):
+    def _stubs(self, port, new_ips=None, parent_net=False,
+               satisfy_ipam=True):
         port_model = None
         if port:
             net_model = models.Network()
@@ -562,13 +572,18 @@ class TestQuarkUpdatePort(test_quark_plugin.TestQuarkPlugin):
             mock.patch("quark.db.api.port_update"),
             mock.patch("quark.ipam.QuarkIpam.allocate_ip_address"),
             mock.patch("quark.ipam.QuarkIpam.deallocate_ips_by_port"),
+            mock.patch("quark.ipam.QuarkIpam.is_strategy_satisfied"),
+            mock.patch("quark.ipam.QuarkIpam._notify_new_addresses"),
             mock.patch("neutron.quota.QuotaEngine.limit_check"),
-        ) as (port_find, port_update, alloc_ip, dealloc_ip, limit_check):
+        ) as (port_find, port_update, alloc_ip, dealloc_ip,
+              ipam_satisfy, notify_new_addresses, limit_check):
             port_find.return_value = port_model
             port_update.return_value = port_model
             if new_ips:
                 alloc_ip.return_value = new_ips
-            yield port_find, port_update, alloc_ip, dealloc_ip
+            ipam_satisfy.return_value = satisfy_ipam
+            yield (port_find, port_update, alloc_ip, dealloc_ip,
+                   notify_new_addresses)
 
     def test_update_port_not_found(self):
         with self._stubs(port=None):
@@ -578,7 +593,8 @@ class TestQuarkUpdatePort(test_quark_plugin.TestQuarkPlugin):
     def test_update_port(self):
         with self._stubs(
             port=dict(id=1, name="myport")
-        ) as (port_find, port_update, alloc_ip, dealloc_ip):
+        ) as (port_find, port_update, alloc_ip, dealloc_ip,
+              notify_new_addresses):
             new_port = dict(port=dict(name="ourport"))
             self.plugin.update_port(self.context, 1, new_port)
             self.assertEqual(port_find.call_count, 2)
@@ -589,9 +605,7 @@ class TestQuarkUpdatePort(test_quark_plugin.TestQuarkPlugin):
                 security_groups=[])
 
     def test_update_port_fixed_ip_bad_request(self):
-        with self._stubs(
-            port=dict(id=1, name="myport")
-        ) as (port_find, port_update, alloc_ip, dealloc_ip):
+        with self._stubs(port=dict(id=1, name="myport")):
             new_port = dict(port=dict(
                 fixed_ips=[dict(subnet_id=None,
                                 ip_address=None)]))
@@ -601,17 +615,38 @@ class TestQuarkUpdatePort(test_quark_plugin.TestQuarkPlugin):
     def test_update_port_fixed_ip(self):
         with self._stubs(
             port=dict(id=1, name="myport", mac_address="0:0:0:0:0:1")
-        ) as (port_find, port_update, alloc_ip, dealloc_ip):
+        ) as (port_find, port_update, alloc_ip, dealloc_ip,
+              notify_new_addresses):
             new_port = dict(port=dict(
                 fixed_ips=[dict(subnet_id=1,
                                 ip_address="1.1.1.1")]))
             self.plugin.update_port(self.context, 1, new_port)
             self.assertEqual(alloc_ip.call_count, 1)
 
-    def test_update_port_fixed_ip_no_subnet_raises(self):
+    def test_update_port_notifies_new_address(self):
         with self._stubs(
             port=dict(id=1, name="myport", mac_address="0:0:0:0:0:1")
-        ) as (port_find, port_update, alloc_ip, dealloc_ip):
+        ) as (port_find, port_update, alloc_ip, dealloc_ip,
+              notify_new_addresses):
+            new_port = dict(port=dict(
+                fixed_ips=[dict(subnet_id=1,
+                                ip_address="1.1.1.1")]))
+            self.plugin.update_port(self.context, 1, new_port)
+            self.assertEqual(notify_new_addresses.call_count, 1)
+
+    def test_update_port_fixed_ip_doesnt_satisy_ipam_strategy_fails(self):
+        with self._stubs(port=dict(id=1, name="myport",
+                                   mac_address="0:0:0:0:0:1"),
+                         satisfy_ipam=False):
+            with self.assertRaises(exceptions.IpAddressGenerationFailure):
+                new_port = dict(port=dict(
+                    fixed_ips=[dict(subnet_id=1,
+                                    ip_address="1.1.1.1")]))
+                self.plugin.update_port(self.context, 1, new_port)
+
+    def test_update_port_fixed_ip_no_subnet_raises(self):
+        with self._stubs(port=dict(id=1, name="myport",
+                                   mac_address="0:0:0:0:0:1")):
             new_port = dict(port=dict(
                 fixed_ips=[dict(ip_address="1.1.1.1")]))
             with self.assertRaises(exceptions.BadRequest):
@@ -620,7 +655,8 @@ class TestQuarkUpdatePort(test_quark_plugin.TestQuarkPlugin):
     def test_update_port_fixed_ip_subnet_only_allocates_ip(self):
         with self._stubs(
             port=dict(id=1, name="myport", mac_address="0:0:0:0:0:1")
-        ) as (port_find, port_update, alloc_ip, dealloc_ip):
+        ) as (port_find, port_update, alloc_ip, dealloc_ip,
+              notify_new_addresses):
             new_port = dict(port=dict(
                 fixed_ips=[dict(subnet_id=1)]))
             self.plugin.update_port(self.context, 1, new_port)
@@ -638,7 +674,8 @@ class TestQuarkUpdatePort(test_quark_plugin.TestQuarkPlugin):
             port=dict(id=1, name="myport", mac_address="0:0:0:0:0:1",
                       ip_addresses=[addr]),
             new_ips=[new_addr]
-        ) as (port_find, port_update, alloc_ip, dealloc_ip):
+        ) as (port_find, port_update, alloc_ip, dealloc_ip,
+              notify_new_addresses):
             new_port = dict(port=dict(
                 fixed_ips=[dict(subnet_id=1,
                                 ip_address=new_addr["address_readable"])]))
@@ -748,7 +785,8 @@ class TestQuarkUpdatePortSetsIps(test_quark_plugin.TestQuarkPlugin):
 
 class TestQuarkPostUpdatePort(test_quark_plugin.TestQuarkPlugin):
     @contextlib.contextmanager
-    def _stubs(self, port, addr, addr2=None, port_ips=None):
+    def _stubs(self, port, addr, addr2=None, port_ips=None,
+               satisfy_ipam=True):
         port_model = None
         addr_model = None
         addr_model2 = None
@@ -774,11 +812,14 @@ class TestQuarkPostUpdatePort(test_quark_plugin.TestQuarkPlugin):
         with contextlib.nested(
             mock.patch("quark.db.api.port_find"),
             mock.patch("quark.ipam.QuarkIpam.allocate_ip_address"),
+            mock.patch("quark.ipam.QuarkIpam.is_strategy_satisfied"),
+            mock.patch("quark.ipam.QuarkIpam._notify_new_addresses"),
             mock.patch("quark.db.api.ip_address_find"),
-        ) as (port_find, alloc_ip, ip_find):
+        ) as (port_find, alloc_ip, ipam_satisy, notify_new_addresses, ip_find):
             port_find.return_value = port_model
-            alloc_ip.return_value = addr_model2 if addr_model2 else addr_model
             ip_find.return_value = addr_model
+            alloc_ip.return_value = [addr_model2] if addr2 else [addr_model]
+            ipam_satisy.return_value = satisfy_ipam
             yield port_find, alloc_ip, ip_find
 
     def test_post_update_port_no_ports(self):
@@ -855,10 +896,22 @@ class TestQuarkPostUpdatePort(test_quark_plugin.TestQuarkPlugin):
             response = self.plugin.post_update_port(self.context, 1,
                                                     new_port_ip)
             self.assertEqual(port_find.call_count, 1)
-            self.assertEqual(alloc_ip.call_count, 1)
             self.assertEqual(ip_find.call_count, 1)
             self.assertEqual(response["fixed_ips"][0]["ip_address"],
                              "192.168.1.101")
+
+    def test_post_update_port_address_doesnt_satisfy_ipam_strategy_fails(self):
+        new_port_ip = dict(port=dict(fixed_ips=[dict(
+            ip_address="192.168.1.101")]))
+        port = dict(port=dict(network_id=1, tenant_id=self.context.tenant_id,
+                              device_id=2))
+        ip_addr = netaddr.IPAddress("192.168.1.101")
+        ip = dict(id=1, address=int(ip_addr), address_readable=str(ip_addr),
+                  subnet_id=1, network_id=2, version=4, deallocated=True)
+        with self._stubs(port=port, addr=None, addr2=ip, satisfy_ipam=False):
+            with self.assertRaises(exceptions.IpAddressGenerationFailure):
+                self.plugin.post_update_port(self.context, 1,
+                                             new_port_ip)
 
     def test_post_update_port_already_has_ip(self):
         new_port_ip = dict(port=dict(fixed_ips=[dict()]))
@@ -879,9 +932,61 @@ class TestQuarkPostUpdatePort(test_quark_plugin.TestQuarkPlugin):
                              "192.168.1.100")
 
 
+class TestQuarkPostUpdatePortNotifyNewAddress(
+        test_quark_plugin.TestQuarkPlugin):
+    @contextlib.contextmanager
+    def _stubs(self, port, addr, addr2=None, port_ips=None,
+               satisfy_ipam=True):
+        port_model = None
+        ip_addr = netaddr.IPAddress("192.168.1.101")
+        ip = dict(id=1, address=int(ip_addr), address_readable=str(ip_addr),
+                  subnet_id=1, network_id=2, version=4, deallocated=True)
+        if port:
+            port_model = models.Port()
+            port_model.update(port)
+            if port_ips:
+                port_model["ip_addresses"] = []
+                for ip in port_ips:
+                    ip_mod = models.IPAddress()
+                    ip_mod.update(ip)
+                    port_model["ip_addresses"].append(ip_mod)
+            net_model = models.Network()
+            net_model["ipam_strategy"] = "ANY"
+            port_model["network"] = net_model
+
+        addr_model = models.IPAddress()
+        addr_model.update(ip)
+        with contextlib.nested(
+            mock.patch("quark.db.api.port_find"),
+            mock.patch("quark.ipam.QuarkIpam.allocate_ip_address"),
+            mock.patch("quark.ipam.QuarkIpam.is_strategy_satisfied"),
+            mock.patch("quark.ipam.QuarkIpam._notify_new_addresses"),
+            mock.patch("quark.db.api.ip_address_find"),
+        ) as (port_find, alloc_ip, ipam_satisfy, notify_new_addresses,
+              ip_find):
+            port_find.return_value = port_model
+            ip_find.return_value = None
+            alloc_ip.return_value = [addr_model]
+            ipam_satisfy.return_value = satisfy_ipam
+            yield port_find, alloc_ip, ip_find, notify_new_addresses
+
+    def test_post_update_port_notifies_new_addresses(self):
+        new_port_ip = dict(port=dict(fixed_ips=[dict(
+            ip_address="192.168.1.101")]))
+        port = dict(port=dict(network_id=1, tenant_id=self.context.tenant_id,
+                              device_id=2))
+        with self._stubs(port=port, addr=None) as (port_find, alloc_ip,
+                                                   ip_find,
+                                                   notify_new_addresses):
+            self.plugin.post_update_port(self.context, 1,
+                                         new_port_ip)
+            self.assertEqual(notify_new_addresses.call_count, 1)
+
+
 class TestQuarkCreatePortOnSharedNetworks(test_quark_plugin.TestQuarkPlugin):
     @contextlib.contextmanager
-    def _stubs(self, port=None, network=None, addr=None, mac=None):
+    def _stubs(self, port=None, network=None, addr=None, mac=None,
+               satisfy_ipam=True):
         self.strategy = {"public_network":
                          {"required": True,
                           "bridge": "xenbr0",
@@ -903,12 +1008,16 @@ class TestQuarkCreatePortOnSharedNetworks(test_quark_plugin.TestQuarkPlugin):
             mock.patch("%s.network_find" % db_mod),
             mock.patch("%s.allocate_ip_address" % ipam),
             mock.patch("%s.allocate_mac_address" % ipam),
+            mock.patch("%s.is_strategy_satisfied" % ipam),
+            mock.patch("%s._notify_new_addresses" % ipam),
             mock.patch("neutron.quota.QuotaEngine.limit_check")
-        ) as (port_create, net_find, alloc_ip, alloc_mac, limit_check):
+        ) as (port_create, net_find, alloc_ip, alloc_mac, ipam_satisfy,
+              notify_new_addresses, limit_check):
             port_create.return_value = port_models
             net_find.return_value = network
             alloc_ip.return_value = addr
             alloc_mac.return_value = mac
+            ipam_satisfy.return_value = satisfy_ipam
             yield port_create
 
     def test_create_port_shared_net_no_quota_check(self):
@@ -941,6 +1050,77 @@ class TestQuarkCreatePortOnSharedNetworks(test_quark_plugin.TestQuarkPlugin):
         with self._stubs(port=port["port"], network=network, addr=ip, mac=mac):
             with self.assertRaises(q_exc.AmbiguousNetworkId):
                 self.plugin.create_port(self.context, port)
+
+    def test_create_port_allocate_ips_not_satify_ipam_strategy_fails(self):
+        network = dict(id=1, ports=[models.Port()],
+                       tenant_id=self.context.tenant_id)
+        mac = dict(address="AA:BB:CC:DD:EE:FF")
+        port_name = "foobar"
+        ip = dict()
+        port = dict(port=dict(mac_address=mac["address"],
+                              network_id="public_network",
+                              tenant_id=self.context.tenant_id, device_id=2,
+                              segment_id="cell01",
+                              name=port_name))
+        with self._stubs(port=port["port"], network=network, addr=ip, mac=mac,
+                         satisfy_ipam=False):
+            with self.assertRaises(exceptions.IpAddressGenerationFailure):
+                self.plugin.create_port(self.context, port)
+
+
+class TestQuarkCreatePortNotifiesNewAddresses(
+        test_quark_plugin.TestQuarkPlugin):
+    @contextlib.contextmanager
+    def _stubs(self, port=None, network=None, addr=None, mac=None,
+               satisfy_ipam=True):
+        self.strategy = {"public_network":
+                         {"required": True,
+                          "bridge": "xenbr0",
+                          "children": {"nova": "child_net"}}}
+        strategy_json = json.dumps(self.strategy)
+        quark_ports.STRATEGY = network_strategy.JSONStrategy(strategy_json)
+
+        if network:
+            network["network_plugin"] = "BASE"
+            network["ipam_strategy"] = "ANY"
+        port_model = models.Port()
+        port_model.update(port)
+        port_models = port_model
+
+        db_mod = "quark.db.api"
+        ipam = "quark.ipam.QuarkIpam"
+        with contextlib.nested(
+            mock.patch("%s.port_create" % db_mod),
+            mock.patch("%s.network_find" % db_mod),
+            mock.patch("%s.allocate_ip_address" % ipam),
+            mock.patch("%s.allocate_mac_address" % ipam),
+            mock.patch("%s.is_strategy_satisfied" % ipam),
+            mock.patch("%s._notify_new_addresses" % ipam),
+            mock.patch("neutron.quota.QuotaEngine.limit_check")
+        ) as (port_create, net_find, alloc_ip, alloc_mac, ipam_satisfy,
+              notify_new_addresses, limit_check):
+            port_create.return_value = port_models
+            net_find.return_value = network
+            alloc_ip.return_value = addr
+            alloc_mac.return_value = mac
+            ipam_satisfy.return_value = satisfy_ipam
+            yield port_create, notify_new_addresses
+
+    def test_create_port_allocate_ips_not_satify_ipam_strategy_fails(self):
+        network = dict(id=1, ports=[models.Port()],
+                       tenant_id=self.context.tenant_id)
+        mac = dict(address="AA:BB:CC:DD:EE:FF")
+        port_name = "foobar"
+        ip = dict()
+        port = dict(port=dict(mac_address=mac["address"],
+                              network_id="public_network",
+                              tenant_id=self.context.tenant_id, device_id=2,
+                              segment_id="cell01",
+                              name=port_name))
+        with self._stubs(port=port["port"], network=network, addr=ip,
+                         mac=mac) as (port_create, notify_new_addresses):
+            self.plugin.create_port(self.context, port)
+            self.assertEqual(notify_new_addresses.call_count, 1)
 
 
 class TestQuarkGetPortCount(test_quark_plugin.TestQuarkPlugin):
@@ -1131,7 +1311,8 @@ class TestPortBadNetworkPlugin(test_quark_plugin.TestQuarkPlugin):
 
 class TestQuarkPortCreateFiltering(test_quark_plugin.TestQuarkPlugin):
     @contextlib.contextmanager
-    def _stubs(self, network=None, addr=None, mac=None):
+    def _stubs(self, network=None, addr=None, mac=None,
+               satisfy_ipam=True):
         network["network_plugin"] = "BASE"
         network["ipam_strategy"] = "ANY"
 
@@ -1143,15 +1324,19 @@ class TestQuarkPortCreateFiltering(test_quark_plugin.TestQuarkPlugin):
             mock.patch("%s.network_find" % db_mod),
             mock.patch("%s.allocate_ip_address" % ipam),
             mock.patch("%s.allocate_mac_address" % ipam),
+            mock.patch("%s.is_strategy_satisfied" % ipam),
+            mock.patch("%s._notify_new_addresses" % ipam),
             mock.patch("neutron.openstack.common.uuidutils.generate_uuid"),
             mock.patch("quark.plugin_views._make_port_dict"),
             mock.patch("%s.port_count_all" % db_mod),
             mock.patch("neutron.quota.QuotaEngine.limit_check")
-        ) as (port_create, net_find, alloc_ip, alloc_mac, gen_uuid, make_port,
-              port_count, limit_check):
+        ) as (port_create, net_find, alloc_ip, alloc_mac,
+              ipam_satisfy, notify_new_addresses,
+              gen_uuid, make_port, port_count, limit_check):
             net_find.return_value = network
             alloc_ip.return_value = addr
             alloc_mac.return_value = mac
+            ipam_satisfy.return_value = satisfy_ipam
             gen_uuid.return_value = 1
             port_count.return_value = 0
             yield port_create, alloc_mac, net_find

@@ -734,33 +734,6 @@ class QuarkIpamTestBothRequiredIpAllocation(QuarkIpamBaseTest):
             self.assertEqual(address[1]["address"], address2["address"])
             self.assertEqual(address[1]["version"], 6)
 
-    def test_allocate_allocate_ip_unsatisfied_strategy_fails(self):
-        old_override = cfg.CONF.QUARK.ip_address_retry_max
-        cfg.CONF.set_override('ip_address_retry_max', 1, 'QUARK')
-
-        subnet4 = dict(id=1, first_ip=0, last_ip=255,
-                       cidr="0.0.0.0/24", ip_version=4,
-                       next_auto_assign_ip=1,
-                       ip_policy=None)
-        subnet6 = dict(id=1, first_ip=self.v6_fip.value,
-                       last_ip=self.v6_lip.value, cidr="feed::/104",
-                       ip_version=6, next_auto_assign_ip=-2,
-                       ip_policy=dict(
-                           size=2,
-                           exclude=[
-                               models.IPPolicyCIDR(cidr="feed::/128"),
-                               models.IPPolicyCIDR(cidr="feed::ff:ffff/128")]))
-
-        with self._stubs(subnets=[[(subnet4, 0)], [(subnet6, 0)]],
-                         addresses=[None, None, None, None]):
-            address = []
-            with self.assertRaises(exceptions.IpAddressGenerationFailure):
-                self.ipam.allocate_ip_address(self.context, address, 0, 0, 0)
-            self.assertEqual(address[0]["address"],
-                             netaddr.IPAddress("::ffff:0.0.0.1").value)
-
-        cfg.CONF.set_override('ip_address_retry_max', old_override, 'QUARK')
-
 
 class QuarkIpamBoth(QuarkIpamBaseTest):
     def setUp(self):
@@ -1116,20 +1089,21 @@ class QuarkIPAddressAllocationTestRetries(QuarkIpamBaseTest):
                     self.context, [], 0, 0, 0, ip_address="0.0.1.0",
                     subnets=subnet1)
 
-    def test_allocate_specific_subnet_unusable_fails(self):
+    def test_allocate_specific_subnet_unusable_doesnt_allocate_address(self):
         subnet1 = dict(id=1, first_ip=0, last_ip=255, next_auto_assign_ip=1,
                        cidr="0.0.0.0/24", ip_version=4,
                        ip_policy=None,
                        do_not_use=1)
         subnets = []
+        addresses = []
         addr_found = dict(id=1, address=256)
         with self._stubs(subnets=subnets,
                          address=[q_exc.IPAddressRetryableFailure,
                                   addr_found]):
-            with self.assertRaises(exceptions.IpAddressGenerationFailure):
-                self.ipam.allocate_ip_address(
-                    self.context, [], 0, 0, 0, ip_address="0.0.1.0",
-                    subnets=subnet1)
+            self.ipam.allocate_ip_address(
+                self.context, addresses, 0, 0, 0, ip_address="0.0.1.0",
+                subnets=subnet1)
+            self.assertEqual(addresses, [])
 
     def test_allocate_last_ip_closes_subnet(self):
         subnet1 = dict(id=1, first_ip=0, last_ip=1, next_auto_assign_ip=1,
@@ -1239,16 +1213,17 @@ class TestQuarkIpPoliciesIpAllocation(QuarkIpamBaseTest):
                                           version=4)
             self.assertEqual(address[0]["address"], first + 1)
 
-    def test_subnet_full_based_on_ip_policy(self):
+    def test_subnet_full_based_on_ip_policy_doesnt_allocate_address(self):
+        addresses = []
         subnet = dict(id=1, first_ip=0, last_ip=255,
                       cidr="0.0.0.0/24", ip_version=4,
                       next_auto_assign_ip=0,
                       ip_policy=dict(size=256, exclude=[
                           models.IPPolicyCIDR(cidr="0.0.0.0/24")]))
         with self._stubs(subnets=[(subnet, 0)], addresses=[None, None]):
-            with self.assertRaises(exceptions.IpAddressGenerationFailure):
-                self.ipam.allocate_ip_address(self.context, [], 0, 0, 0,
-                                              version=4)
+            self.ipam.allocate_ip_address(self.context, addresses, 0, 0, 0,
+                                          version=4)
+            self.assertEqual(addresses, [])
 
     def test_ip_policy_on_subnet(self):
         old_override = cfg.CONF.QUARK.ip_address_retry_max
@@ -1312,31 +1287,6 @@ class QuarkIPAddressAllocationNotifications(QuarkIpamBaseTest):
             subnet_find.return_value = subnets
             time.return_value = deleted_at
             yield notify
-
-    def test_allocation_notification(self):
-        subnet = dict(id=1, first_ip=0, last_ip=255,
-                      cidr="0.0.0.0/24", ip_version=4,
-                      next_auto_assign_ip=0,
-                      ip_policy=None)
-        address = dict(address=0, created_at="123", subnet_id=1,
-                       address_readable="0.0.0.0", used_by_tenant_id=1)
-        with self._stubs(
-            address,
-            subnets=[(subnet, 1)],
-            addresses=[None, None]
-        ) as notify:
-            addr = []
-            self.ipam.allocate_ip_address(self.context, addr, 0, 0, 0,
-                                          version=4)
-            notify.assert_called_once_with("network")
-            notify.return_value.info.assert_called_once_with(
-                self.context,
-                "ip_block.address.create",
-                dict(ip_block_id=address["subnet_id"],
-                     ip_address="0.0.0.0",
-                     device_ids=[],
-                     created_at=address["created_at"],
-                     used_by_tenant_id=1))
 
     def test_deallocation_notification(self):
         addr_dict = dict(address=0, created_at="123", subnet_id=1,

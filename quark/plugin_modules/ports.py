@@ -139,6 +139,10 @@ def create_port(context, port):
                     CONF.QUARK.ipam_reuse_after, segment_id=segment_id,
                     mac_address=mac)
 
+            _check_ipam_strategy_satisfied(
+                context, ipam_driver, addresses, net["id"])
+            ipam_driver._notify_new_addresses(context, addresses)
+
         @cmd_mgr.undo
         def _allocate_ips_undo(addr):
             LOG.info("Rolling back IP addresses...")
@@ -310,10 +314,15 @@ def update_port(context, id, port):
                 reuse_after=CONF.QUARK.ipam_reuse_after,
                 subnets=[subnet_id])
 
+        port_dict["addresses"] = port_db["ip_addresses"]
         # Need to return all existing addresses and the new ones
         if addresses:
-            port_dict["addresses"] = port_db["ip_addresses"]
             port_dict["addresses"].extend(addresses)
+
+        _check_ipam_strategy_satisfied(
+            context, ipam_driver, port_dict["addresses"],
+            port_db["network_id"])
+        ipam_driver._notify_new_addresses(context, addresses)
 
     net_driver = registry.DRIVER_REGISTRY.get_driver(
         port_db.network["network_plugin"])
@@ -355,6 +364,7 @@ def post_update_port(context, id, port):
     if "fixed_ips" in port and port["fixed_ips"]:
         for ip in port["fixed_ips"]:
             address = None
+            addresses = []
             ipam_driver = ipam.IPAM_REGISTRY.get_strategy(
                 port_db["network"]["ipam_strategy"])
             if ip:
@@ -371,14 +381,23 @@ def post_update_port(context, id, port):
                         network_id=port_db["network_id"],
                         tenant_id=context.tenant_id, scope=db_api.ONE)
                     if not address:
-                        address = ipam_driver.allocate_ip_address(
-                            context, port_db["network_id"], id,
+                        addresses = ipam_driver.allocate_ip_address(
+                            context, addresses, port_db["network_id"], id,
                             CONF.QUARK.ipam_reuse_after,
                             ip_address=ip_address)
+                        _check_ipam_strategy_satisfied(
+                            context, ipam_driver, addresses,
+                            port_db["network_id"])
+                        ipam_driver._notify_new_addresses(context, addresses)
+                        address = addresses[0]
             else:
-                address = ipam_driver.allocate_ip_address(
-                    context, port_db["network_id"], id,
+                addresses = ipam_driver.allocate_ip_address(
+                    context, addresses, port_db["network_id"], id,
                     CONF.QUARK.ipam_reuse_after)
+                _check_ipam_strategy_satisfied(
+                    context, ipam_driver, addresses, port_db["network_id"])
+                ipam_driver._notify_new_addresses(context, addresses)
+                address = addresses[0]
 
         address["deallocated"] = 0
 
@@ -540,3 +559,10 @@ def _make_security_group_list(context, group_ids):
             raise sg_ext.SecurityGroupNotFound(id=gid)
         groups.append(group)
     return (group_ids, groups)
+
+
+def _check_ipam_strategy_satisfied(context, ipam_driver,
+                                   addresses, net_id):
+    if not ipam_driver.is_strategy_satisfied(addresses,
+                                             allocate_complete=True):
+        raise exceptions.IpAddressGenerationFailure(net_id=net_id)

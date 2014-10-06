@@ -429,11 +429,7 @@ class QuarkIpam(object):
 
             break
 
-        if self.is_strategy_satisfied(new_addresses, allocate_complete=True):
-            self._notify_new_addresses(context, new_addresses)
-            return
-
-        raise exceptions.IpAddressGenerationFailure(net_id=net_id)
+        return new_addresses
 
     def deallocate_ip_address(self, context, address):
         address["deallocated"] = 1
