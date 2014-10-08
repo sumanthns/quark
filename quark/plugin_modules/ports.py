@@ -132,12 +132,18 @@ def create_port(context, port):
                         context, addresses, net["id"], port_id,
                         CONF.QUARK.ipam_reuse_after, segment_id=segment_id,
                         ip_address=ip_address, subnets=[subnet_id],
-                        mac_address=mac)
+                        mac_address=mac, check_ipam_strategy=False)
             else:
                 ipam_driver.allocate_ip_address(
                     context, addresses, net["id"], port_id,
                     CONF.QUARK.ipam_reuse_after, segment_id=segment_id,
-                    mac_address=mac)
+                    mac_address=mac, check_ipam_strategy=False)
+
+            if ipam_driver.is_strategy_satisfied(addresses,
+                                                 allocate_complete=True):
+                ipam_driver._notify_new_addresses(context, addresses)
+            else:
+                raise exceptions.IpAddressGenerationFailure(net_id=net_id)
 
         @cmd_mgr.undo
         def _allocate_ips_undo(addr):

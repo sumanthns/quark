@@ -196,7 +196,8 @@ class TestQuarkGetPortsByIPAddress(test_quark_plugin.TestQuarkPlugin):
 
 class TestQuarkCreatePortFailure(test_quark_plugin.TestQuarkPlugin):
     @contextlib.contextmanager
-    def _stubs(self, port=None, network=None, addr=None, mac=None):
+    def _stubs(self, port=None, network=None, addr=None, mac=None,
+               port_exists=True, satisfy_ipam=True):
         if network:
             network["network_plugin"] = "BASE"
             network["ipam_strategy"] = "ANY"
@@ -213,14 +214,16 @@ class TestQuarkCreatePortFailure(test_quark_plugin.TestQuarkPlugin):
             mock.patch("%s.allocate_ip_address" % ipam),
             mock.patch("%s.allocate_mac_address" % ipam),
             mock.patch("%s.port_count_all" % db_mod),
+            mock.patch("%s.is_strategy_satisfied" % ipam)
         ) as (port_create, net_find, port_find, alloc_ip, alloc_mac,
-              port_count):
+              port_count, ipam_satisfy):
             port_create.return_value = port_models
             net_find.return_value = network
-            port_find.return_value = models.Port()
+            port_find.return_value = port_exists
             alloc_ip.return_value = addr
             alloc_mac.return_value = mac
             port_count.return_value = 0
+            ipam_satisfy.return_value = satisfy_ipam
             yield port_create
 
     def test_create_multiple_ports_on_same_net_and_device_id_bad_request(self):
@@ -234,10 +237,26 @@ class TestQuarkCreatePortFailure(test_quark_plugin.TestQuarkPlugin):
                                 tenant_id=self.context.tenant_id, device_id=1,
                                 name="Faker"))
 
-        with self._stubs(port=port_1, network=network, addr=ip, mac=mac):
+        with self._stubs(port=port_1, network=network, addr=ip, mac=mac,
+                         port_exists=True):
             with self.assertRaises(exceptions.BadRequest):
                 self.plugin.create_port(self.context, port_1)
                 self.plugin.create_port(self.context, port_2)
+
+    def test_create_port_doesnt_satisy_ipam_strategy_raises(self):
+        network = dict(id=2, tenant_id=self.context.tenant_id)
+        ip = dict()
+        mac = dict(address="AA:BB:CC:DD:EE:FF")
+        port_1 = dict(port=dict(mac_address="AA:BB:CC:DD:EE:00",
+                                network_id=2,
+                                tenant_id=self.context.tenant_id, device_id=3,
+                                segment_id="bar",
+                                name="Fake"))
+
+        with self._stubs(port=port_1, network=network, addr=ip, mac=mac,
+                         port_exists=False, satisfy_ipam=False):
+            with self.assertRaises(exceptions.IpAddressGenerationFailure):
+                self.plugin.create_port(self.context, port_1)
 
 
 class TestQuarkCreatePortRM9305(test_quark_plugin.TestQuarkPlugin):
@@ -267,14 +286,16 @@ class TestQuarkCreatePortRM9305(test_quark_plugin.TestQuarkPlugin):
             mock.patch("%s.allocate_ip_address" % ipam),
             mock.patch("%s.allocate_mac_address" % ipam),
             mock.patch("%s.port_count_all" % db_mod),
+            mock.patch("%s.is_strategy_satisfied" % ipam)
         ) as (port_create, net_find, port_find, alloc_ip, alloc_mac,
-              port_count):
+              port_count, ipam_satisfy):
             port_create.return_value = port_models
             net_find.return_value = network
             port_find.return_value = None
             alloc_ip.return_value = addr
             alloc_mac.return_value = mac
             port_count.return_value = 0
+            ipam_satisfy.return_value = True
             yield port_create
 
     def test_RM9305_tenant_create_servicenet_port(self):
@@ -356,9 +377,10 @@ class TestQuarkCreatePortsSameDevBadRequest(test_quark_plugin.TestQuarkPlugin):
             mock.patch("%s.allocate_ip_address" % ipam),
             mock.patch("%s.allocate_mac_address" % ipam),
             mock.patch("%s.port_count_all" % db_mod),
-            mock.patch("neutron.quota.QuotaEngine.limit_check")
+            mock.patch("neutron.quota.QuotaEngine.limit_check"),
+            mock.patch("%s.is_strategy_satisfied" % ipam),
         ) as (port_create, net_find, alloc_ip, alloc_mac, port_count,
-              limit_check):
+              limit_check, ipam_satisfy):
             port_create.return_value = port_models
             net_find.return_value = network
             alloc_ip.return_value = addr
@@ -366,6 +388,7 @@ class TestQuarkCreatePortsSameDevBadRequest(test_quark_plugin.TestQuarkPlugin):
             port_count.return_value = 0
             if limit_checks:
                 limit_check.side_effect = limit_checks
+            ipam_satisfy.return_value = True
             yield port_create
 
     def test_create_port(self):
@@ -903,12 +926,15 @@ class TestQuarkCreatePortOnSharedNetworks(test_quark_plugin.TestQuarkPlugin):
             mock.patch("%s.network_find" % db_mod),
             mock.patch("%s.allocate_ip_address" % ipam),
             mock.patch("%s.allocate_mac_address" % ipam),
+            mock.patch("%s.is_strategy_satisfied" % ipam),
             mock.patch("neutron.quota.QuotaEngine.limit_check")
-        ) as (port_create, net_find, alloc_ip, alloc_mac, limit_check):
+        ) as (port_create, net_find, alloc_ip, alloc_mac,
+              ipam_satisfy, limit_check):
             port_create.return_value = port_models
             net_find.return_value = network
             alloc_ip.return_value = addr
             alloc_mac.return_value = mac
+            ipam_satisfy.return_value = True
             yield port_create
 
     def test_create_port_shared_net_no_quota_check(self):
@@ -1146,14 +1172,16 @@ class TestQuarkPortCreateFiltering(test_quark_plugin.TestQuarkPlugin):
             mock.patch("neutron.openstack.common.uuidutils.generate_uuid"),
             mock.patch("quark.plugin_views._make_port_dict"),
             mock.patch("%s.port_count_all" % db_mod),
-            mock.patch("neutron.quota.QuotaEngine.limit_check")
+            mock.patch("neutron.quota.QuotaEngine.limit_check"),
+            mock.patch("%s.is_strategy_satisfied" % ipam),
         ) as (port_create, net_find, alloc_ip, alloc_mac, gen_uuid, make_port,
-              port_count, limit_check):
+              port_count, limit_check, ipam_satisfy):
             net_find.return_value = network
             alloc_ip.return_value = addr
             alloc_mac.return_value = mac
             gen_uuid.return_value = 1
             port_count.return_value = 0
+            ipam_satisfy.return_value = True
             yield port_create, alloc_mac, net_find
 
     def test_create_port_attribute_filtering(self):

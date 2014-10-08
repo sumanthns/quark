@@ -397,7 +397,8 @@ class QuarkIpam(object):
 
     def allocate_ip_address(self, context, new_addresses, net_id, port_id,
                             reuse_after, segment_id=None, version=None,
-                            ip_address=None, subnets=None, **kwargs):
+                            ip_address=None, subnets=None,
+                            check_ipam_strategy=True, **kwargs):
         elevated = context.elevated()
         if ip_address:
             ip_address = netaddr.IPAddress(ip_address)
@@ -429,11 +430,13 @@ class QuarkIpam(object):
 
             break
 
-        if self.is_strategy_satisfied(new_addresses, allocate_complete=True):
-            self._notify_new_addresses(context, new_addresses)
-            return
+        if check_ipam_strategy:
+            if self.is_strategy_satisfied(new_addresses,
+                                          allocate_complete=True):
+                self._notify_new_addresses(context, new_addresses)
+                return
 
-        raise exceptions.IpAddressGenerationFailure(net_id=net_id)
+            raise exceptions.IpAddressGenerationFailure(net_id=net_id)
 
     def deallocate_ip_address(self, context, address):
         address["deallocated"] = 1
