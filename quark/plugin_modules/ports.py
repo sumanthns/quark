@@ -297,7 +297,7 @@ def update_port(context, id, port):
             if ip in ip_addresses:
                 ipam_driver.allocate_ip_address(
                     context, addresses, port_db["network_id"],
-                    port_db["id"], reuse_after=None, ip_address=ip,
+                    port_db["id"], reuse_after=None, ip_addresses=[ip],
                     subnets=[ip_addresses[ip]])
 
         for ip in ips_to_deallocate:
@@ -374,7 +374,7 @@ def post_update_port(context, id, port):
                         address = ipam_driver.allocate_ip_address(
                             context, port_db["network_id"], id,
                             CONF.QUARK.ipam_reuse_after,
-                            ip_address=ip_address)
+                            ip_addresses=[ip_address])
             else:
                 address = ipam_driver.allocate_ip_address(
                     context, port_db["network_id"], id,
